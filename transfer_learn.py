@@ -15,17 +15,16 @@ TODO: Make this script more general so that it can be used to transfer learn for
 paul@darwinai.ca
 """
 import argparse
+from collections import namedtuple
 import cv2
 import os
-import pathlib
-from typing import List
-from collections import namedtuple
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import confusion_matrix
 import tensorflow as tf
 
-from eval import eval
 from data import BalanceDataGenerator
 
 
@@ -39,12 +38,15 @@ VARS_TO_FORGET = [
     'dense_1/bias:0',
 ]
 IMAGE_SHAPE = (224, 224, 3)
-DISPLAY_STEP = 1
+INPUT_TENSOR_NAME = "input_1:0"
+OUTPUT_TENSOR_NAME = "dense_3/Softmax:0"
+SAMPLE_WEIGHTS = "dense_3_sample_weights:0"
 
 
-def get_parse_fn(num_classes: int):
+def get_parse_fn(num_classes: int, augment: bool = False):
     def parse_function(imagepath: str, label: int):
         """Parse a single element of the stratification dataset"""
+        # TODO add augmentation here ideally
         image_decoded = tf.image.resize_images(
             tf.image.decode_jpeg(tf.io.read_file(imagepath), IMAGE_SHAPE[-1]), IMAGE_SHAPE[:2])
         return (
@@ -55,19 +57,73 @@ def get_parse_fn(num_classes: int):
     return parse_function
 
 
+def parse_split(split_txt_path: str) -> Tuple[List[str], List[int]]:
+    """Read the offsets for COVID patients based on the files in our split"""
+    # FIXME: ideally we should just store the offset in the split as well or read it from CSV by id.
+    # FIXME: we need a different split or more data - existing split does not respect
+    files, labels = [], [],
+    for split_entry in open(split_txt_path).readlines():
+        _, image_file, diagnosis = split_entry.strip().split() # TODO: txts should just contain ids
+        if diagnosis == 'COVID-19':
+            patient = csv[csv["filename"] == image_file]
+            recorded_offset = patient['offset'].item()
+            if not np.isnan(recorded_offset):
+                offset = stratify(int(recorded_offset))
+                image_path = os.path.abspath(
+                    os.path.join(args.chestxraydir, 'images', image_file))
+                assert os.path.exists(image_path), "Missing file {}".format(image_path)
+                files.append(image_path)
+                labels.append(offset)
+    return files, labels
+
+
+def eval_net(sess: tf.Session, dataset_dict: Dict[str, Any], test_files: List[str],
+             test_labels: List[int]) -> None:
+    """Evaluate the network"""
+    # Reset eval iterator
+    sess.run(dataset_dict['iterator'].initializer)
+
+    # Eval
+    preds, all_labels = [], []
+    num_evaled = 0
+    while True:
+        try:
+            images, labels, sample_weights = sess.run(dataset_dict['gn_op'])
+            pred = sess.run(
+                OUTPUT_TENSOR_NAME,
+                feed_dict={INPUT_TENSOR_NAME: images, SAMPLE_WEIGHTS: sample_weights}
+            )
+            preds.append(np.array(pred).argmax(axis=1))
+            num_evaled += len(pred)
+            all_labels.extend(np.array(labels).argmax(axis=1))
+        except tf.errors.OutOfRangeError:
+            print("\tevaluated {} images.".format(num_evaled))
+            break
+
+    matrix = confusion_matrix(all_labels, np.concatenate(preds)).astype('float')
+    per_class_acc = [
+        matrix[i,i]/np.sum(matrix[i,:]) if np.sum(matrix[i,:]) else 0 for i in range(len(matrix))
+    ]
+    print("confusion matrix:\n{}\nper-class accuracies:\n{}".format(matrix, per_class_acc))
+
+
 if __name__ == "__main__":
 
-    # Input args
+    # Input args NOTE: the params here differ from thise in train_tf.py - we are fine-tuning
     parser = argparse.ArgumentParser(description='COVID-Net Transfer Learning Script (offset).')
     parser.add_argument('--classes', default=4, type=int,
                         help='Number of classes to stratify offset into.')
     parser.add_argument('--stratification', type=int, nargs='+', default=[3, 5, 10],
                         help='Stratification points (days), i.e. "5 10" produces stratification of'
                         ': 0o <-0c-> 5o <-1c-> 10o -2c-> via >= comparison (o=offset, c=class).')
-    parser.add_argument('--epochs', default=5, type=int,
+    parser.add_argument('--epochs', default=10, type=int,
                         help='Number of epochs (less since we\'re effectively fine-tuning).')
-    parser.add_argument('--lr', default=0.00002, type=float, help='Learning rate.')
-    parser.add_argument('--bs', default=8, type=int, help='Batch size')
+    parser.add_argument('--lr', default=0.000002, type=float, help='Learning rate.')
+    parser.add_argument('--bs', default=8, type=int, help='Train batch-size')
+    parser.add_argument('--evalbs', default=8, type=int, help='Eval batch-size')
+    parser.add_argument('--evaliterval', default=3, type=int,
+                        help='# of epochs to train before running evaluation. NOTE: we only save'
+                        'after evaluation. This can be disabled when more test data is available')
     parser.add_argument('--inputweightsdir', default='models/COVIDNetv2', type=str,
                         help='Path to input folder containing a trained COVID-Net checkpoint')
     parser.add_argument('--inputmetafile', default='model.meta', type=str,
@@ -103,30 +159,11 @@ if __name__ == "__main__":
         "https://github.com/ieee8023/covid-chestxray-dataset and pass path to dir as --chestxraydir"
     csv = pd.read_csv(os.path.join(args.chestxraydir, "metadata.csv"), nrows=None)
 
-    # We need to read the offsets for COVID patients in our split
-    # FIXME: ideally we should just store the offset in the split as well or read it from CSV by id.
-    # FIXME: we need a different split or more data - existing split does not respect
-    train_files, train_labels, test_files, test_labels = [], [], [], []
-    for is_training, split_txt in zip([True, False], [args.trainfile, args.testfile]):
-        for split_entry in open(split_txt).readlines():
-            _, image_file, diagnosis = split_entry.strip().split()
-            if diagnosis == 'COVID-19':
-                patient = csv[csv["filename"] == image_file]
-                recorded_offset = patient['offset'].item()
-                if not np.isnan(recorded_offset):
-                    offset = stratify(int(recorded_offset))
-                    image_path = os.path.abspath(
-                        os.path.join(args.chestxraydir, 'images', image_file))
-                    assert os.path.exists(image_path), "Missing file {}".format(image_path)
-                    if is_training:
-                        train_files.append(image_path)
-                        train_labels.append(offset)
-                    else:
-                        test_files.append(image_path)
-                        test_labels.append(offset)
-
-    assert len(train_files) >= 0 and len(train_labels) >= 0, "Got no train cases"
-    assert len(test_files) >= 0 and len(test_labels) >= 0, "Got no test cases"
+    # Get the image filepaths and labels for training and testing split
+    train_files, train_labels = parse_split(args.trainfile)
+    assert len(train_files) >= 0 and len(train_files) == len(train_labels)
+    test_files, test_labels = parse_split(args.testfile)
+    assert len(test_files) >= 0 and len(test_labels) == len(test_files)
     print("collected {} training and {} test cases for transfer-learning".format(
         len(train_files), len(test_files)))
 
@@ -148,7 +185,6 @@ if __name__ == "__main__":
     #                                       output_shapes=([batch_size, 224, 224, 3],
     #                                                      [batch_size, 3],
     #                                                      [batch_size]))
-    # TODO: we need a training method that we can re-use. below very similar to train_tf.py
 
     # Output path creation for this run with lr param in name
     train_dir = os.path.join(args.outputdir, args.name + '-lr' + str(args.lr))
@@ -172,24 +208,38 @@ if __name__ == "__main__":
                 restore_vars_list.append(var)
         restore_saver = tf.train.Saver(var_list=restore_vars_list)
         restore_saver.restore(sess, tf.train.latest_checkpoint(args.inputweightsdir))
+        existing_vars = sess.graph.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
 
-        # Get I/O tensors
-        image_tensor = graph.get_tensor_by_name("input_1:0")
+        # Get some I/O tensors
+        image_tensor = graph.get_tensor_by_name(INPUT_TENSOR_NAME)
         labels_tensor = graph.get_tensor_by_name("dense_3_target:0")
-        sample_weights = graph.get_tensor_by_name("dense_3_sample_weights:0")
+        sample_weights = graph.get_tensor_by_name(SAMPLE_WEIGHTS)
         pred_tensor = graph.get_tensor_by_name("dense_3/MatMul:0")
 
-        # Define tf.dataset
-        existing_vars = sess.graph.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
-        dataset = tf.data.Dataset.from_tensor_slices((train_files, train_labels))
-        dataset = dataset.map(get_parse_fn(num_classes))
-        dataset = dataset.shuffle(15).batch(batch_size=args.bs).repeat()
-        iterator = dataset.make_initializable_iterator()
-        gn_op = iterator.get_next()
+        # Define tf.datasets
+        datasets = {}
+        for is_training, files, labels in zip(
+                [True, False], [train_files, test_files], [train_labels, test_labels]):
+
+            dataset = tf.data.Dataset.from_tensor_slices((files, labels))
+            dataset = dataset.map(get_parse_fn(num_classes))
+            if is_training:
+                dataset = dataset.shuffle(15)
+            dataset = dataset.batch(batch_size=args.bs if is_training else args.evalbs)
+            if is_training:
+                dataset = dataset.repeat()
+            iterator = dataset.make_initializable_iterator()
+            datasets['train' if is_training else 'test'] = {
+                'dataset': dataset,
+                'iterator': iterator,
+                'gn_op': iterator.get_next(),
+            }
 
         # Define loss and optimizer
-        loss_op = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
-            logits=pred_tensor, labels=labels_tensor)*sample_weights)
+        loss_op = tf.reduce_mean(
+            tf.nn.softmax_cross_entropy_with_logits_v2(
+                logits=pred_tensor, labels=labels_tensor) * sample_weights
+        )
         optimizer = tf.train.AdamOptimizer(learning_rate=args.lr)
         train_op = optimizer.minimize(loss_op)
         optim_vars = list(
@@ -201,27 +251,38 @@ if __name__ == "__main__":
         # save base model
         saver = tf.train.Saver()
         saver.save(sess, os.path.join(train_dir, 'model'))
-        print('Saved baseline checkpoint')
-        #print('Baseline eval:')
-        #eval(sess, graph, test_files, 'test')  # FIXME: need eval for this network
+        print('Saved pre-trained model with re-initialized output layers.')
+        print('Baseline eval:')
+        eval_net(sess, datasets['test'], test_files, test_labels)
 
         # Training cycle
+        # TODO: we need a training method that we can re-use. below very similar to train_tf.py
+        # FIXME: we need to consider freezing vars for all but dense layers.
         print('Transfer Learning Started.')
-        print('\t{} train samples\n\t{} test samples\n'.format(len(train_files), len(test_files)))
-        sess.run(iterator.initializer.name)
+        print('\ttrain samples: {}\n\ttest samples:  {}\n\tstratification: {}\n'.format(
+            len(train_files), len(test_files), args.stratification))
+        sess.run(datasets['train']['iterator'].initializer)
         num_batches = len(train_files) // args.bs
         progbar = tf.keras.utils.Progbar(num_batches)
         for epoch in range(args.epochs):
+
+            # Train
+            print("Fine-Tuning on 1 epoch = {} images.".format(len(train_files)))
             for i in range(num_batches):
 
-                # Run optimization
-                batch_x, batch_y, weights = sess.run(gn_op)
-                sess.run(train_op, feed_dict={image_tensor: batch_x,
-                                              labels_tensor: batch_y,
-                                              sample_weights: weights})
-                progbar.update(i+1)
+                batch_x, batch_y, weights = sess.run(datasets['train']['gn_op'])
+                sess.run(
+                    train_op,
+                    feed_dict={
+                        image_tensor: batch_x,
+                        labels_tensor: batch_y,
+                        sample_weights: weights,
+                    }
+                )
+                progbar.update(i + 1)
 
-            if epoch % DISPLAY_STEP == 0:
+            # Evaluate + save
+            if epoch % args.evaliterval == 0:
                 pred = sess.run(pred_tensor, feed_dict={image_tensor:batch_x})
                 loss = sess.run(
                     loss_op,
@@ -232,13 +293,13 @@ if __name__ == "__main__":
                     }
                )
                 print("Epoch:", '%04d' % (epoch + 1), "Minibatch loss=", "{:.9f}".format(loss))
-                # eval(sess, graph, test_files, 'test')
+                eval_net(sess, datasets['test'], test_files, test_labels)
                 saver.save(
                     sess,
                     os.path.join(train_dir, 'model'),
-                    global_step=epoch+1,
+                    global_step=epoch + 1,
                     write_meta_graph=False
                 )
                 print('Saving checkpoint at epoch {}'.format(epoch + 1))
 
-    print("Transfer Learning Finished!")
+    print("Transfer Learning Finished!\n\t{}".format(train_dir))
