@@ -60,7 +60,7 @@ def get_parse_fn(num_classes: int, augment: bool = False):
 def parse_split(split_txt_path: str) -> Tuple[List[str], List[int]]:
     """Read the offsets for COVID patients based on the files in our split"""
     # FIXME: ideally we should just store the offset in the split as well or read it from CSV by id.
-    # FIXME: we need a different split or more data - existing split does not respect
+    # FIXME: we need to add pretrained weights + .txts for split with well-distributed offset.
     files, labels = [], [],
     for split_entry in open(split_txt_path).readlines():
         _, image_file, diagnosis = split_entry.strip().split() # TODO: txts should just contain ids
@@ -146,7 +146,8 @@ if __name__ == "__main__":
         "Missing file {}".format(args.inputmetafile)
 
     # Format and define a stratification method based on our points
-    assert len(args.stratification) > 1, "Must pass more than one offset stratification point"
+    # TODO we could do a different amount of stratification but we have to add our own dense layers
+    assert len(args.stratification) == 3, "Must pass exactly 3 offset stratification points"
     if args.stratification[0] != 0:
         stratification = np.array([0, *args.stratification])
     else:
@@ -302,4 +303,4 @@ if __name__ == "__main__":
                 )
                 print('Saving checkpoint at epoch {}'.format(epoch + 1))
 
-    print("Transfer Learning Finished!\n\t{}".format(train_dir))
+    print("Transfer Learning Finished!\n\tcheckpoint: '{}'".format(train_dir))
